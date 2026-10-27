@@ -15,7 +15,9 @@ import {
   extractStreamDelta,
 } from './lib/chat-pipeline.mjs'
 import { appendVisibleLogs, createLogChunkBuffers, flushLogChunkBuffer, processBufferedLogChunk, processLogChunk } from './lib/log-pipeline.mjs'
-import { DEFAULT_HOST, assertNoCoreArgConflicts, assertStartableServerConfig, isServerReadyLine, runtimeWarnings, serviceUrls, splitExtraArgs } from './lib/runtime-policy.mjs'
+import { createPortInspector } from './lib/port-inspector.mjs'
+import { DEFAULT_HOST, assertNoCoreArgConflicts, assertStartableServerConfig, runtimeWarnings, serviceUrls, splitExtraArgs } from './lib/runtime-policy.mjs'
+import { createRuntimeSupervisor, probeHttpReady } from './lib/runtime-supervisor.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -33,8 +35,7 @@ let mainWindow = null
 let tray = null
 let appIsQuitting = false
 let firstHideNoticeShown = false
-let serverChild = null
-let stoppingServer = false
+let runtimeSupervisor = null
 let runtimeStatus = {
   state: 'stopped',
   message: '服务未启动',
@@ -193,98 +194,12 @@ function appendLogResult(result) {
   }, entries, 1200)
 
   for (const entry of entries) {
-    if (isServerReadyLine(entry.line)) {
-      markServerReady('log')
-    }
+    runtimeSupervisor?.handleLogLine(entry.line)
     if (entry.line.toLowerCase().includes('error')) {
       setStatus({ message: entry.line })
     }
   }
   sendEvent({ type: 'logs', logs: logs.entries, logStats: logStats() })
-}
-
-const READY_PROBE_INTERVAL_MS = 800
-const READY_PROBE_TIMEOUT_MS = 2500
-const READY_PROBE_MAX_MS = 60 * 60 * 1000
-const READY_PROBE_SLOW_HINT_MS = 120 * 1000
-let readyProbeRunId = 0
-
-function markServerReady(source, config) {
-  if (runtimeStatus.state !== 'starting') {
-    return false
-  }
-  setStatus({
-    state: 'running',
-    message: '服务正在监听',
-    pid: serverChild?.pid || null,
-    url: config ? localUrl(config) : runtimeStatus.url,
-    startedAt: runtimeStatus.startedAt,
-  })
-  addLog('desktop', source === 'health'
-    ? '就绪检测通过：接口探活成功，服务已开始监听。'
-    : '就绪检测通过：收到 llama.cpp 监听日志。')
-  return true
-}
-
-function delay(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
-async function probeHttpReady(baseUrl) {
-  for (const route of ['/health', '/v1/models', '/props']) {
-    try {
-      const response = await fetch(`${baseUrl}${route}`, {
-        headers: { Accept: 'application/json' },
-        signal: AbortSignal.timeout(READY_PROBE_TIMEOUT_MS),
-      })
-      const status = response.status
-      try {
-        await response.arrayBuffer()
-      } catch {
-        // 响应体读失败不影响就绪判断
-      }
-      if (status === 200) {
-        return true
-      }
-      if (status !== 404) {
-        return false
-      }
-    } catch {
-      // 端口还没监听或请求超时，继续轮询
-    }
-  }
-  return false
-}
-
-async function watchServerReady(config) {
-  const runId = ++readyProbeRunId
-  const baseUrl = localUrl(config).replace(/\/+$/, '')
-  const startedAt = Date.now()
-  let slowHintSent = false
-
-  while (readyProbeRunId === runId && runtimeStatus.state === 'starting') {
-    const elapsed = Date.now() - startedAt
-    if (elapsed > READY_PROBE_MAX_MS) {
-      setStatus({ message: '等待监听超时，请检查模型大小与显存占用' })
-      addLog('desktop', '就绪检测超时：服务进程仍在运行但接口没有响应，可点“检查端口”排查。')
-      return false
-    }
-    if (!slowHintSent && elapsed > READY_PROBE_SLOW_HINT_MS) {
-      slowHintSent = true
-      addLog('desktop', `已等待 ${Math.round(elapsed / 1000)} 秒仍未就绪，大模型首次加载可能较慢。`)
-    }
-    if (await probeHttpReady(baseUrl)) {
-      if (readyProbeRunId !== runId) {
-        return false
-      }
-      return markServerReady('health', config)
-    }
-    if (readyProbeRunId !== runId) {
-      return false
-    }
-    await delay(READY_PROBE_INTERVAL_MS)
-  }
-  return false
 }
 
 function stripTomlComment(line) {
@@ -625,41 +540,18 @@ function canBindPort(port) {
   })
 }
 
-async function suggestedPort(startPort) {
-  for (let port = startPort + 1; port < startPort + 40; port += 1) {
-    if (await canBindPort(port)) return port
-  }
-  return startPort + 1
-}
+const inspectPort = createPortInspector({ runPowerShellJson, canBindPort })
 
-async function inspectPort(port) {
-  const targetPort = Number(port) || 8080
-  const script = [
-    `$connections = Get-NetTCPConnection -LocalPort ${targetPort} -ErrorAction SilentlyContinue`,
-    '$items = foreach ($connection in $connections) {',
-    '  $process = Get-Process -Id $connection.OwningProcess -ErrorAction SilentlyContinue',
-    '  [pscustomobject]@{ pid = $connection.OwningProcess; name = $process.ProcessName; state = $connection.State; localAddress = $connection.LocalAddress }',
-    '}',
-    '$items | ConvertTo-Json -Compress',
-  ].join('; ')
-  const raw = await runPowerShellJson(script, [])
-  const processes = (Array.isArray(raw) ? raw : raw ? [raw] : [])
-    .filter(item => item?.pid)
-    .map(item => ({
-      pid: Number(item.pid),
-      name: String(item.name || 'unknown'),
-      state: String(item.state || ''),
-      localAddress: String(item.localAddress || ''),
-    }))
-  const occupied = processes.length > 0 || !(await canBindPort(targetPort))
-  return {
-    checked: true,
-    port: targetPort,
-    occupied,
-    processes,
-    suggestedPort: occupied ? await suggestedPort(targetPort) : targetPort,
-  }
-}
+runtimeSupervisor = createRuntimeSupervisor({
+  inspectPort,
+  probeHttp: baseUrl => probeHttpReady(baseUrl),
+  spawnProcess: (command, args, options) => spawn(command, args, options),
+  terminateProcessTree: taskkill,
+  emitStatus: setStatus,
+  emitLog: message => addLog('desktop', message),
+  onOutput: addBufferedLog,
+  onFlush: flushServerLogBuffers,
+})
 
 function hasValue(value) {
   return value !== undefined && value !== null && String(value).trim() !== ''
@@ -1065,14 +957,8 @@ function updateTrayMenu() {
     },
     {
       label: '停止服务',
-      enabled: Boolean(serverChild && serverChild.exitCode === null),
-      click: async () => {
-        if (serverChild && serverChild.exitCode === null) {
-          stoppingServer = true
-          setStatus({ state: 'stopping', message: '正在停止服务' })
-          await taskkill(serverChild.pid)
-        }
-      },
+      enabled: runtimeSupervisor.isActive(),
+      click: () => runtimeSupervisor.stop(),
     },
     { type: 'separator' },
     {
@@ -1167,7 +1053,7 @@ function registerIpc() {
   })
 
   ipcMain.handle('llama:start-server', async (_event, payload) => {
-    if (serverChild && serverChild.exitCode === null) {
+    if (runtimeSupervisor.isActive()) {
       return appState()
     }
 
@@ -1182,18 +1068,8 @@ function registerIpc() {
 
     logs = { entries: [], filtered: 0, truncated: 0, dropped: 0 }
     serverLogChunkBuffers = createLogChunkBuffers()
-    stoppingServer = false
-    setStatus({
-      state: 'starting',
-      message: '正在启动服务',
-      pid: null,
-      url: localUrl(config),
-      startedAt: new Date().toISOString(),
-    })
     const serverDir = path.dirname(config.llama_server_path)
-    const command = launch.command
     const args = launch.args
-    const cwd = launch.cwd
     addLog('desktop', `启动方式：${directMode ? 'direct llama-server.exe' : 'launcher'}`)
     addLog('desktop', `llama-server：${config.llama_server_path}`)
     if (directMode) {
@@ -1204,52 +1080,30 @@ function registerIpc() {
     addLog('desktop', `启动器：${config.launcher_path}`)
     addLog('desktop', `配置：${config.config_path}`)
 
-    serverChild = spawn(command, args, {
-      cwd,
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        NO_COLOR: '1',
-        Path: `${serverDir};${process.env.Path || process.env.PATH || ''}`,
+    await runtimeSupervisor.start({
+      config,
+      launch: {
+        ...launch,
+        spawnOptions: {
+          cwd: launch.cwd,
+          windowsHide: true,
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            ...process.env,
+            NO_COLOR: '1',
+            Path: `${serverDir};${process.env.Path || process.env.PATH || ''}`,
+          },
+        },
       },
-    })
-
-    setStatus({ pid: serverChild.pid })
-    serverChild.stdout?.on('data', chunk => addBufferedLog('stdout', chunk))
-    serverChild.stderr?.on('data', chunk => addBufferedLog('stderr', chunk))
-    serverChild.once('error', error => {
-      readyProbeRunId += 1
-      setStatus({ state: 'error', message: error.message, pid: null })
-      flushServerLogBuffers()
-      addLog('desktop', `启动失败：${error.message}`)
-    })
-    serverChild.once('exit', code => {
-      readyProbeRunId += 1
-      const wasStopping = stoppingServer
-      const message = wasStopping ? '服务已停止' : `服务进程已退出：${code ?? 'unknown'}`
-      serverChild = null
-      stoppingServer = false
-      setStatus({ state: wasStopping ? 'stopped' : 'error', message, pid: null })
-      flushServerLogBuffers()
-      addLog('desktop', message)
-    })
-
-    void watchServerReady(config).catch(error => {
-      addLog('desktop', `就绪检测异常：${error instanceof Error ? error.message : String(error)}`)
+      directMode,
+      baseUrl: localUrl(config),
     })
 
     return appState()
   })
 
   ipcMain.handle('llama:stop-server', async () => {
-    readyProbeRunId += 1
-    if (serverChild && serverChild.exitCode === null) {
-      stoppingServer = true
-      setStatus({ state: 'stopping', message: '正在停止服务' })
-      await taskkill(serverChild.pid)
-      flushServerLogBuffers()
-    }
+    await runtimeSupervisor.stop()
     return appState()
   })
 
@@ -1669,10 +1523,9 @@ if (!gotLock) {
 
   app.on('before-quit', async event => {
     appIsQuitting = true
-    if (serverChild && serverChild.exitCode === null && !stoppingServer) {
+    if (runtimeSupervisor.isActive()) {
       event.preventDefault()
-      stoppingServer = true
-      await taskkill(serverChild.pid)
+      await runtimeSupervisor.stop()
       app.quit()
     }
   })

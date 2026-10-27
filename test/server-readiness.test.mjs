@@ -2,6 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { isServerReadyLine } from '../desktop/lib/runtime-policy.mjs'
+import { probeHttpReady } from '../desktop/lib/runtime-supervisor.mjs'
 
 const mainSource = readFileSync(new URL('../desktop/main.mjs', import.meta.url), 'utf8')
 
@@ -31,20 +32,47 @@ test('readiness ignores model loading, slot bookkeeping and bind errors', () => 
   assert.equal(isServerReadyLine(undefined), false)
 })
 
-test('main process readiness detection is version tolerant and has an HTTP probe fallback', () => {
-  assert.match(mainSource, /isServerReadyLine\(entry\.line\)/)
+test('main process delegates readiness to the runtime supervisor', () => {
+  assert.match(mainSource, /runtimeSupervisor\?\.handleLogLine\(entry\.line\)/)
   assert.doesNotMatch(mainSource, /entry\.line\.includes\('server is listening'\)/)
-  assert.match(mainSource, /async function probeHttpReady\(/)
-  assert.match(mainSource, /async function watchServerReady\(/)
-  assert.match(mainSource, /void watchServerReady\(config\)/)
-  assert.match(mainSource, /readyProbeRunId \+= 1/)
+  assert.match(mainSource, /createRuntimeSupervisor\(/)
 })
 
-test('readiness probe accepts only HTTP 200 and falls back across server routes', () => {
-  const probe = mainSource.match(/async function probeHttpReady\([\s\S]*?\n\}/)?.[0] || ''
-  assert.match(probe, /'\/health'/)
-  assert.match(probe, /'\/v1\/models'/)
-  assert.match(probe, /status === 200/)
-  assert.match(probe, /status !== 404/)
-  assert.match(probe, /AbortSignal\.timeout\(READY_PROBE_TIMEOUT_MS\)/)
+test('readiness probe falls back across routes and accepts only HTTP 200', async () => {
+  const requested = []
+  const fetchImpl = async url => {
+    requested.push(url)
+    return {
+      status: url.endsWith('/health') ? 404 : 200,
+      async arrayBuffer() {
+        return new ArrayBuffer(0)
+      },
+    }
+  }
+
+  const ready = await probeHttpReady('http://127.0.0.1:8080', { fetchImpl })
+
+  assert.equal(ready, true)
+  assert.deepEqual(requested, [
+    'http://127.0.0.1:8080/health',
+    'http://127.0.0.1:8080/v1/models',
+  ])
+})
+
+test('a model that is still loading does not fall through as ready', async () => {
+  const requested = []
+  const fetchImpl = async url => {
+    requested.push(url)
+    return {
+      status: 503,
+      async arrayBuffer() {
+        return new ArrayBuffer(0)
+      },
+    }
+  }
+
+  const ready = await probeHttpReady('http://127.0.0.1:8080', { fetchImpl })
+
+  assert.equal(ready, false)
+  assert.deepEqual(requested, ['http://127.0.0.1:8080/health'])
 })
