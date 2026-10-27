@@ -15,7 +15,7 @@ import {
   extractStreamDelta,
 } from './lib/chat-pipeline.mjs'
 import { appendVisibleLogs, createLogChunkBuffers, flushLogChunkBuffer, processBufferedLogChunk, processLogChunk } from './lib/log-pipeline.mjs'
-import { DEFAULT_HOST, assertNoCoreArgConflicts, assertStartableServerConfig, runtimeWarnings, serviceUrls, splitExtraArgs } from './lib/runtime-policy.mjs'
+import { DEFAULT_HOST, assertNoCoreArgConflicts, assertStartableServerConfig, isServerReadyLine, runtimeWarnings, serviceUrls, splitExtraArgs } from './lib/runtime-policy.mjs'
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -193,14 +193,98 @@ function appendLogResult(result) {
   }, entries, 1200)
 
   for (const entry of entries) {
-    if (entry.line.includes('server is listening')) {
-      setStatus({ state: 'running', message: '服务正在监听', pid: serverChild?.pid || null })
+    if (isServerReadyLine(entry.line)) {
+      markServerReady('log')
     }
     if (entry.line.toLowerCase().includes('error')) {
       setStatus({ message: entry.line })
     }
   }
   sendEvent({ type: 'logs', logs: logs.entries, logStats: logStats() })
+}
+
+const READY_PROBE_INTERVAL_MS = 800
+const READY_PROBE_TIMEOUT_MS = 2500
+const READY_PROBE_MAX_MS = 60 * 60 * 1000
+const READY_PROBE_SLOW_HINT_MS = 120 * 1000
+let readyProbeRunId = 0
+
+function markServerReady(source, config) {
+  if (runtimeStatus.state !== 'starting') {
+    return false
+  }
+  setStatus({
+    state: 'running',
+    message: '服务正在监听',
+    pid: serverChild?.pid || null,
+    url: config ? localUrl(config) : runtimeStatus.url,
+    startedAt: runtimeStatus.startedAt,
+  })
+  addLog('desktop', source === 'health'
+    ? '就绪检测通过：接口探活成功，服务已开始监听。'
+    : '就绪检测通过：收到 llama.cpp 监听日志。')
+  return true
+}
+
+function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+async function probeHttpReady(baseUrl) {
+  for (const route of ['/health', '/v1/models', '/props']) {
+    try {
+      const response = await fetch(`${baseUrl}${route}`, {
+        headers: { Accept: 'application/json' },
+        signal: AbortSignal.timeout(READY_PROBE_TIMEOUT_MS),
+      })
+      const status = response.status
+      try {
+        await response.arrayBuffer()
+      } catch {
+        // 响应体读失败不影响就绪判断
+      }
+      if (status === 200) {
+        return true
+      }
+      if (status !== 404) {
+        return false
+      }
+    } catch {
+      // 端口还没监听或请求超时，继续轮询
+    }
+  }
+  return false
+}
+
+async function watchServerReady(config) {
+  const runId = ++readyProbeRunId
+  const baseUrl = localUrl(config).replace(/\/+$/, '')
+  const startedAt = Date.now()
+  let slowHintSent = false
+
+  while (readyProbeRunId === runId && runtimeStatus.state === 'starting') {
+    const elapsed = Date.now() - startedAt
+    if (elapsed > READY_PROBE_MAX_MS) {
+      setStatus({ message: '等待监听超时，请检查模型大小与显存占用' })
+      addLog('desktop', '就绪检测超时：服务进程仍在运行但接口没有响应，可点“检查端口”排查。')
+      return false
+    }
+    if (!slowHintSent && elapsed > READY_PROBE_SLOW_HINT_MS) {
+      slowHintSent = true
+      addLog('desktop', `已等待 ${Math.round(elapsed / 1000)} 秒仍未就绪，大模型首次加载可能较慢。`)
+    }
+    if (await probeHttpReady(baseUrl)) {
+      if (readyProbeRunId !== runId) {
+        return false
+      }
+      return markServerReady('health', config)
+    }
+    if (readyProbeRunId !== runId) {
+      return false
+    }
+    await delay(READY_PROBE_INTERVAL_MS)
+  }
+  return false
 }
 
 function stripTomlComment(line) {
@@ -1135,27 +1219,31 @@ function registerIpc() {
     serverChild.stdout?.on('data', chunk => addBufferedLog('stdout', chunk))
     serverChild.stderr?.on('data', chunk => addBufferedLog('stderr', chunk))
     serverChild.once('error', error => {
+      readyProbeRunId += 1
+      setStatus({ state: 'error', message: error.message, pid: null })
       flushServerLogBuffers()
       addLog('desktop', `启动失败：${error.message}`)
-      setStatus({ state: 'error', message: error.message, pid: null })
     })
     serverChild.once('exit', code => {
-      flushServerLogBuffers()
-      const message = stoppingServer ? '服务已停止' : `服务进程已退出：${code ?? 'unknown'}`
-      addLog('desktop', message)
+      readyProbeRunId += 1
+      const wasStopping = stoppingServer
+      const message = wasStopping ? '服务已停止' : `服务进程已退出：${code ?? 'unknown'}`
       serverChild = null
-      setStatus({
-        state: stoppingServer ? 'stopped' : 'error',
-        message,
-        pid: null,
-      })
       stoppingServer = false
+      setStatus({ state: wasStopping ? 'stopped' : 'error', message, pid: null })
+      flushServerLogBuffers()
+      addLog('desktop', message)
+    })
+
+    void watchServerReady(config).catch(error => {
+      addLog('desktop', `就绪检测异常：${error instanceof Error ? error.message : String(error)}`)
     })
 
     return appState()
   })
 
   ipcMain.handle('llama:stop-server', async () => {
+    readyProbeRunId += 1
     if (serverChild && serverChild.exitCode === null) {
       stoppingServer = true
       setStatus({ state: 'stopping', message: '正在停止服务' })

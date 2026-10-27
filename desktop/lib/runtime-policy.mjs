@@ -71,6 +71,24 @@ export function assertStartableServerConfig(config = {}, pathExists = () => true
   }
 }
 
+// llama.cpp 不同版本启动完成时打印的日志格式不同：
+//   <= b95xx : "main: server is listening on http://127.0.0.1:8080"
+//   >= b10xxx: "srv  llama_server: listening on http://0.0.0.0:8080"
+// 只靠固定子串匹配会漏掉新版，必须用多形态正则，并配合 HTTP 就绪轮询兜底。
+export const SERVER_READY_LINE_PATTERNS = [
+  /\bserver\s+is\s+listening\b/i,
+  /\bserver\s+listening\b/i,
+  /\bllama[-_ ]?server\b[^\n]*\blistening\b/i,
+  /\blistening\b\s*(?:on|at)?\s*:?\s*https?:\/\//i,
+  /\bserver\s+(?:has\s+)?started\b/i,
+]
+
+export function isServerReadyLine(line) {
+  const text = String(line || '')
+  if (!text) return false
+  return SERVER_READY_LINE_PATTERNS.some(pattern => pattern.test(text))
+}
+
 function formatUrlHost(host) {
   return host.includes(':') && !(host.startsWith('[') && host.endsWith(']')) ? `[${host}]` : host
 }
